@@ -1,0 +1,27 @@
+name: Build WFX Plugin
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        # Собираем под две архитектуры: 64-бит и 32-бит
+        arch: [x64, Win32] 
+    
+    steps:
+    - name: Скачивание кода
+      uses: actions/checkout@v4
+
+    - name: Настройка CMake (${{ matrix.arch }})
+      run: cmake -B build_${{ matrix.arch }} -A ${{ matrix.arch }}
+
+    - name: Компиляция плагина
+      run: cmake --build build_${{ matrix.arch }} --config Release
+
+    - name: Загрузка готового плагина
+      uses: actions/upload-artifact@v4
+      with:
+        name: Anomaly_Plugin_${{ matrix.arch }}
+        path: build_${{ matrix.arch }}/Release/anomaly_db.*
