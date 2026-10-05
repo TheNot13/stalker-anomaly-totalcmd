@@ -2,12 +2,15 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <algorithm>
+#include "minilzo.h"
 
 std::vector<std::string> virtual_files;
 int current_file_index = 0;
 
-void DumpFAT() {
+void ReadFAT() {
     virtual_files.clear();
+    
     // ВПИШИ СЮДА ПУТЬ К АРХИВУ НА СВОЕМ ПК!
     std::string db_path = "Y:\\ANTHOLOGY\\Anomaly-1.5.3-Anthology 2.1\\db\\configs\\configs.xdb0";  
     
@@ -21,59 +24,74 @@ void DumpFAT() {
     file.seekg(0, std::ios::beg);
 
     uint32_t version = 0;
-    uint32_t ini_size = 0;
-    
     file.read(reinterpret_cast<char*>(&version), 4);
-    file.read(reinterpret_cast<char*>(&ini_size), 4);
     
-    // Пропускаем INI текст
-    file.seekg(ini_size, std::ios::cur);
+    uint32_t fat_offset = 0;
+    uint32_t compressed_fat_size = 0;
     
-    uint32_t val1 = 0;
-    uint32_t val2 = 0;
-    file.read(reinterpret_cast<char*>(&val1), 4);
-    file.read(reinterpret_cast<char*>(&val2), 4);
-
-    // В Anomaly 666 смещение на FAT лежит во второй переменной
-    uint32_t fat_offset = val2;
-
-    if (fat_offset == 0 || fat_offset >= file_size) {
-        virtual_files.push_back("ERROR_INVALID_FAT_OFFSET.txt");
+    if (version == 666) {
+        uint32_t ini_size = 0;
+        file.read(reinterpret_cast<char*>(&ini_size), 4);
+        file.seekg(ini_size, std::ios::cur); // Пропускаем текст INI
+        
+        uint32_t val1 = 0, val2 = 0;
+        file.read(reinterpret_cast<char*>(&val1), 4);
+        file.read(reinterpret_cast<char*>(&val2), 4);
+        
+        fat_offset = val2;
+        compressed_fat_size = static_cast<uint32_t>(file_size) - fat_offset;
+    } else if (version == 29) {
+        // Поддержка старых форматов оригинала на всякий случай
+        file.read(reinterpret_cast<char*>(&fat_offset), 4);
+        file.read(reinterpret_cast<char*>(&compressed_fat_size), 4);
+    } else {
+        virtual_files.push_back("ERROR_UNSUPPORTED_VERSION_" + std::to_string(version) + ".txt");
         return;
     }
 
-    // Прыгаем в конец архива к таблице файлов
+    // Читаем сжатый блок таблицы FAT
     file.seekg(fat_offset, std::ios::beg);
-    
-    uint8_t buf[256] = {0};
-    file.read(reinterpret_cast<char*>(buf), 256);
+    std::vector<uint8_t> comp_fat(compressed_fat_size);
+    file.read(reinterpret_cast<char*>(comp_fat.data()), compressed_fat_size);
     file.close();
 
-    // Записываем кусок FAT в файл
-    std::string dump_path = "C:\\Users\\Public\\anomaly_fat_dump.txt"; 
-    std::ofstream dump(dump_path);
-    if (dump.is_open()) {
-        dump << "FILE SIZE: " << file_size << "\n";
-        dump << "FAT OFFSET: " << fat_offset << "\n";
-        dump << "VAL1 (fat size?): " << val1 << "\n\n";
-        dump << "HEX DUMP OF FAT:\n";
-        for (int i = 0; i < 256; i++) {
-            char hex[8];
-            snprintf(hex, sizeof(hex), "%02X ", buf[i]);
-            dump << hex;
-            if ((i + 1) % 16 == 0) dump << "\n";
-        }
-        dump << "\nASCII DUMP OF FAT:\n";
-        for (int i = 0; i < 256; i++) {
-            if (buf[i] >= 32 && buf[i] <= 126) dump << (char)buf[i];
-            else dump << ".";
-            if ((i + 1) % 64 == 0) dump << "\n";
-        }
-        dump.close();
-        virtual_files.push_back("FAT_DUMP_SAVED.txt");
-    } else {
-        virtual_files.push_back("ERROR_WRITE_DUMP.txt");
+    // Готовим буфер на 20 МБ для распаковки
+    lzo_uint decomp_size = 20 * 1024 * 1024; 
+    std::vector<uint8_t> decomp_fat(decomp_size);
+    
+    // Распаковываем!
+    int r = lzo1x_decompress_safe(comp_fat.data(), comp_fat.size(), decomp_fat.data(), &decomp_size, NULL);
+    
+    if (r != LZO_E_OK) {
+        virtual_files.push_back("ERROR_DECOMPRESS_LZO_" + std::to_string(r) + ".txt");
+        return;
     }
+    
+    // Парсим таблицу файлов
+    uint32_t fat_ptr = 0;
+    int count = 0;
+    
+    while (fat_ptr < decomp_size) {
+        if (fat_ptr + 12 > decomp_size) break;
+        
+        uint32_t size_real = *(uint32_t*)(decomp_fat.data() + fat_ptr); fat_ptr += 4;
+        uint32_t size_comp = *(uint32_t*)(decomp_fat.data() + fat_ptr); fat_ptr += 4;
+        uint32_t crc = *(uint32_t*)(decomp_fat.data() + fat_ptr); fat_ptr += 4;
+        
+        std::string name = reinterpret_cast<char*>(decomp_fat.data() + fat_ptr);
+        fat_ptr += name.length() + 1; // Пропускаем имя и нуль-терминатор
+        
+        // Заменяем слеши на подчеркивания для плоского вывода
+        std::replace(name.begin(), name.end(), '\\', '_');
+        std::replace(name.begin(), name.end(), '/', '_');
+        
+        if (count < 100) {
+            virtual_files.push_back(name);
+        }
+        count++;
+    }
+    
+    virtual_files.push_back("SUCCESS_TOTAL_FILES_PARSED_" + std::to_string(count) + ".txt");
 }
 
 // --- Функции Total Commander ---
@@ -85,10 +103,13 @@ typedef struct {
 } tfsDefaultParamStruct;
 
 extern "C" {
-    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { return 0; }
+    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) {
+        if (lzo_init() != LZO_E_OK) return -1;
+        return 0;
+    }
 
     __declspec(dllexport) HANDLE __stdcall FsFindFirst(char* path, WIN32_FIND_DATAA* FindData) {
-        if (std::string(path) == "\\") DumpFAT();
+        if (std::string(path) == "\\") ReadFAT();
         
         current_file_index = 0;
         if (virtual_files.empty()) {
