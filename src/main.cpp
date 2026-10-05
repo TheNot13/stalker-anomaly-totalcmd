@@ -8,14 +8,12 @@
 std::vector<std::string> virtual_files;
 int current_file_index = 0;
 
-// Чтобы узнать, где лежит наша DLL
-extern "C" __declspec(dllexport) int __stdcall FsInit(int, void*); 
-
 // Функция для получения пути к нашему INI файлу
 std::string GetIniPath() {
     char path[MAX_PATH];
     HMODULE hm = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&FsInit, &hm);
+    // Берем адрес самой этой функции, чтобы винда поняла, в какой мы DLL
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&GetIniPath, &hm);
     GetModuleFileNameA(hm, path, sizeof(path));
     std::string full_path(path);
     size_t pos = full_path.find_last_of("\\/");
@@ -110,7 +108,7 @@ void ReadFAT() {
         std::string name = reinterpret_cast<char*>(decomp_fat.data() + fat_ptr);
         fat_ptr += name.length() + 1; 
         
-        // Заменяем слеши на подчеркивания, чтобы ТС не думал что это папки (пока мы не сделали дерево)
+        // Заменяем слеши на подчеркивания
         std::replace(name.begin(), name.end(), '\\', '_');
         std::replace(name.begin(), name.end(), '/', '_');
         
