@@ -2,6 +2,7 @@
 #include <vector>
 #include <memory>
 #include <cstring>
+#include <stdexcept>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -50,7 +51,7 @@ private:
     };
 
     inline int _getb() {
-        if (in_iterator == in_end) return -1;
+        if (in_iterator >= in_end) return -1;
         return *in_iterator++;
     }
 
@@ -173,6 +174,8 @@ private:
 
 public:
     std::vector<u8> Decode(const u8* src, u32 src_sz) {
+        if (src_sz < 4) return {};
+        
         in_start = src;
         in_end = src + src_sz;
         in_iterator = in_start;
@@ -186,7 +189,8 @@ public:
         textsize |= (_getb() << 16);
         textsize |= (_getb() << 24);
         
-        if (textsize == 0 || textsize == (unsigned int)-1) return {};
+        // ЗАЩИТА ОТ КРАША: Таблица файлов не может весить больше 150 МБ после распаковки
+        if (textsize == 0 || textsize > 150 * 1024 * 1024) return {};
 
         std::vector<u8> out_buf;
         out_buf.reserve(textsize);
