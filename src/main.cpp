@@ -20,7 +20,10 @@ struct FindItem {
 std::vector<FindItem> current_find_items;
 int current_find_index = 0;
 
-void Logger(const std::string& msg) {}
+void Logger(const std::string& msg) {
+    std::ofstream log("C:\\Users\\Public\\anomaly_wfx.log", std::ios::app);
+    if (log.is_open()) log << msg << "\n";
+}
 
 std::string GetIniPath() {
     char path[MAX_PATH];
@@ -39,6 +42,7 @@ void BuildVFS() {
     GetPrivateProfileStringA("Settings", "GamePath", "", result, MAX_PATH, GetIniPath().c_str());
     std::string game_path(result);
     
+    Logger("=== СКАНИРОВАНИЕ ДИРЕКТОРИИ: " + game_path + " ===");
     if (game_path.empty() || !fs::exists(game_path)) return;
 
     std::vector<std::string> archives;
@@ -54,6 +58,7 @@ void BuildVFS() {
         std::sort(archives.begin(), archives.end());
         for (const auto& arc : archives) ParseArchive(arc);
     } catch (...) {}
+    Logger("=== СКАНИРОВАНИЕ ЗАВЕРШЕНО ===");
 }
 
 VfsNode* FindNode(const std::string& path) {
@@ -82,13 +87,14 @@ VfsNode* FindNode(const std::string& path) {
     return current;
 }
 
-// --- WFX API ---
 typedef struct { int size; DWORD vLow; DWORD vHi; char ini[MAX_PATH]; } tfsDefaultParamStruct;
 typedef struct { DWORD sizeLow; DWORD sizeHigh; FILETIME lastWriteTime; int attr; } RemoteInfoStruct;
 
 extern "C" {
     __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { 
         lzo_init();
+        std::ofstream log("C:\\Users\\Public\\anomaly_wfx.log", std::ios::trunc);
+        log << "Anomaly WFX Plugin Initialized\n";
         return 0; 
     }
 
@@ -145,7 +151,7 @@ extern "C" {
     __declspec(dllexport) int __stdcall FsFindClose(HANDLE Hdl) { return 0; }
     __declspec(dllexport) void __stdcall FsGetDefRootName(char* DefRootName, int maxlen) { lstrcpynA(DefRootName, "Anomaly DB", maxlen); }
 
-    // НОВАЯ ФУНКЦИЯ: ИЗВЛЕЧЕНИЕ / ПРОСМОТР ФАЙЛОВ
+    // Извлечение файлов
     __declspec(dllexport) int __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri) {
         VfsNode* node = FindNode(RemoteName);
         if (!node || node->is_dir) return FS_FILE_NOTFOUND;
@@ -161,16 +167,24 @@ extern "C" {
         if (!out.is_open()) return FS_FILE_WRITEERROR;
 
         if (node->size_real == node->size_compr) {
-            // Файл не сжат
             out.write(reinterpret_cast<char*>(comp_data.data()), node->size_real);
         } else {
-            // Файл сжат LZO
+            // Пробуем LZO
             std::vector<u8> decomp_data(node->size_real);
             lzo_uint out_len = node->size_real;
             int r = lzo1x_decompress_safe(comp_data.data(), comp_data.size(), decomp_data.data(), &out_len, NULL);
-            if (r != LZO_E_OK) return FS_FILE_READERROR;
-            
-            out.write(reinterpret_cast<char*>(decomp_data.data()), out_len);
+            if (r == LZO_E_OK) {
+                out.write(reinterpret_cast<char*>(decomp_data.data()), out_len);
+            } else {
+                // Если не LZO, пробуем LzHuf
+                LzhDecoder decoder;
+                std::vector<u8> dec = decoder.Decode(comp_data.data(), comp_data.size());
+                if (!dec.empty()) {
+                    out.write(reinterpret_cast<char*>(dec.data()), dec.size());
+                } else {
+                    return FS_FILE_READERROR;
+                }
+            }
         }
         return FS_FILE_OK;
     }
