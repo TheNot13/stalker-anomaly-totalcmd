@@ -1,5 +1,11 @@
 #include <windows.h>
 #include "vfs.h"
+#include "minilzo.h"
+
+#define FS_FILE_OK 0
+#define FS_FILE_NOTFOUND 2
+#define FS_FILE_READERROR 3
+#define FS_FILE_WRITEERROR 4
 
 VfsNode vfs_root;
 bool vfs_loaded = false;
@@ -8,18 +14,13 @@ struct FindItem {
     std::string name;
     bool is_dir;
     uint32_t size;
+    FILETIME ft;
 };
 
 std::vector<FindItem> current_find_items;
 int current_find_index = 0;
 
-void Logger(const std::string& msg) {
-    // Пишем логи в общую папку
-    std::ofstream log("C:\\Users\\Public\\anomaly_wfx.log", std::ios::app);
-    if (log.is_open()) {
-        log << msg << "\n";
-    }
-}
+void Logger(const std::string& msg) {}
 
 std::string GetIniPath() {
     char path[MAX_PATH];
@@ -34,25 +35,13 @@ std::string GetIniPath() {
 
 void BuildVFS() {
     vfs_root.children.clear();
-    
     char result[MAX_PATH];
     GetPrivateProfileStringA("Settings", "GamePath", "", result, MAX_PATH, GetIniPath().c_str());
     std::string game_path(result);
     
-    Logger("==== СТАРТ ПЛАГИНА ====");
-    Logger("Путь к игре: " + game_path);
-
-    if (game_path.empty() || !fs::exists(game_path)) {
-        VfsNode err;
-        err.name = "ERROR_GAMEPATH_NOT_FOUND_IN_INI.txt";
-        err.is_dir = false;
-        vfs_root.children[err.name] = err;
-        Logger("Ошибка: Путь не найден!");
-        return;
-    }
+    if (game_path.empty() || !fs::exists(game_path)) return;
 
     std::vector<std::string> archives;
-    
     try {
         for (const auto& entry : fs::recursive_directory_iterator(game_path)) {
             if (entry.is_regular_file()) {
@@ -62,122 +51,127 @@ void BuildVFS() {
                 }
             }
         }
-
         std::sort(archives.begin(), archives.end());
-        Logger("Найдено архивов: " + std::to_string(archives.size()));
+        for (const auto& arc : archives) ParseArchive(arc);
+    } catch (...) {}
+}
 
-        for (const auto& arc : archives) {
-            ParseArchive(arc);
-        }
-    } catch (...) {
-        Logger("Критическая ошибка во время сканирования папки!");
+VfsNode* FindNode(const std::string& path) {
+    if (path == "\\" || path.empty()) return &vfs_root;
+    size_t start = 0;
+    if (path[0] == '\\') start = 1;
+    
+    VfsNode* current = &vfs_root;
+    size_t end = path.find('\\', start);
+
+    while (end != std::string::npos) {
+        std::string part = path.substr(start, end - start);
+        if (current->children.find(part) != current->children.end()) {
+            current = &current->children[part];
+        } else return nullptr;
+        start = end + 1;
+        end = path.find('\\', start);
     }
+
+    if (start < path.length()) {
+        std::string part = path.substr(start);
+        if (current->children.find(part) != current->children.end()) {
+            return &current->children[part];
+        } else return nullptr;
+    }
+    return current;
 }
 
 // --- WFX API ---
 typedef struct { int size; DWORD vLow; DWORD vHi; char ini[MAX_PATH]; } tfsDefaultParamStruct;
+typedef struct { DWORD sizeLow; DWORD sizeHigh; FILETIME lastWriteTime; int attr; } RemoteInfoStruct;
 
 extern "C" {
     __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { 
-        // Очищаем лог при старте
-        std::ofstream log("C:\\Users\\Public\\anomaly_wfx.log", std::ios::trunc);
+        lzo_init();
         return 0; 
     }
 
     __declspec(dllexport) HANDLE __stdcall FsFindFirst(char* path, WIN32_FIND_DATAA* FindData) {
-        try {
-            if (!vfs_loaded) {
-                BuildVFS();
-                vfs_loaded = true;
-            }
+        if (!vfs_loaded) { BuildVFS(); vfs_loaded = true; }
+        current_find_items.clear();
+        current_find_index = 0;
 
-            current_find_items.clear();
-            current_find_index = 0;
-
-            std::string search_path(path);
-            
-            VfsNode* current = &vfs_root;
-            bool found = true;
-            
-            // Ручной сплит пути без лишних векторов
-            size_t start = 0;
-            if (!search_path.empty() && search_path[0] == '\\') start = 1;
-            size_t end = search_path.find('\\', start);
-
-            while (end != std::string::npos) {
-                std::string part = search_path.substr(start, end - start);
-                if (current->children.find(part) != current->children.end()) {
-                    current = &current->children[part];
-                } else {
-                    found = false;
-                    break;
-                }
-                start = end + 1;
-                end = search_path.find('\\', start);
-            }
-
-            if (found && start < search_path.length()) {
-                std::string part = search_path.substr(start);
-                if (current->children.find(part) != current->children.end()) {
-                    current = &current->children[part];
-                } else {
-                    found = false;
-                }
-            }
-
-            if (!found || current->children.empty()) {
-                SetLastError(ERROR_NO_MORE_FILES);
-                return INVALID_HANDLE_VALUE;
-            }
-
-            // Копируем данные в вектор для выдачи Тоталу
-            for (auto const& [key, val] : current->children) {
-                current_find_items.push_back({val.name, val.is_dir, val.size_real});
-            }
-
-            memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
-            lstrcpynA(FindData->cFileName, current_find_items[0].name.c_str(), MAX_PATH);
-            
-            if (current_find_items[0].is_dir) {
-                FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-            } else {
-                FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-                FindData->nFileSizeLow = current_find_items[0].size;
-            }
-            
-            current_find_index = 1;
-            return (HANDLE)1; 
-        } catch (...) {
-            Logger("Критическая ошибка в FsFindFirst");
+        VfsNode* current = FindNode(path);
+        if (!current || current->children.empty()) {
             SetLastError(ERROR_NO_MORE_FILES);
             return INVALID_HANDLE_VALUE;
         }
+
+        for (auto const& [key, val] : current->children) {
+            current_find_items.push_back({val.name, val.is_dir, val.size_real, val.time_write});
+        }
+
+        memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
+        lstrcpynA(FindData->cFileName, current_find_items[0].name.c_str(), MAX_PATH);
+        FindData->ftLastWriteTime = current_find_items[0].ft;
+        
+        if (current_find_items[0].is_dir) {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        } else {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            FindData->nFileSizeLow = current_find_items[0].size;
+        }
+        
+        current_find_index = 1;
+        return (HANDLE)1; 
     }
 
     __declspec(dllexport) BOOL __stdcall FsFindNext(HANDLE Hdl, WIN32_FIND_DATAA* FindData) {
-        try {
-            if (current_find_index >= current_find_items.size()) {
-                SetLastError(ERROR_NO_MORE_FILES);
-                return FALSE;
-            }
-            
-            memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
-            lstrcpynA(FindData->cFileName, current_find_items[current_find_index].name.c_str(), MAX_PATH);
-            
-            if (current_find_items[current_find_index].is_dir) {
-                FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-            } else {
-                FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-                FindData->nFileSizeLow = current_find_items[current_find_index].size;
-            }
-            
-            current_find_index++;
-            return TRUE;
-        } catch (...) {
+        if (current_find_index >= current_find_items.size()) {
+            SetLastError(ERROR_NO_MORE_FILES);
             return FALSE;
         }
+        memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
+        lstrcpynA(FindData->cFileName, current_find_items[current_find_index].name.c_str(), MAX_PATH);
+        FindData->ftLastWriteTime = current_find_items[current_find_index].ft;
+        
+        if (current_find_items[current_find_index].is_dir) {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        } else {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            FindData->nFileSizeLow = current_find_items[current_find_index].size;
+        }
+        
+        current_find_index++;
+        return TRUE;
     }
 
     __declspec(dllexport) int __stdcall FsFindClose(HANDLE Hdl) { return 0; }
     __declspec(dllexport) void __stdcall FsGetDefRootName(char* DefRootName, int maxlen) { lstrcpynA(DefRootName, "Anomaly DB", maxlen); }
+
+    // НОВАЯ ФУНКЦИЯ: ИЗВЛЕЧЕНИЕ / ПРОСМОТР ФАЙЛОВ
+    __declspec(dllexport) int __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri) {
+        VfsNode* node = FindNode(RemoteName);
+        if (!node || node->is_dir) return FS_FILE_NOTFOUND;
+
+        std::ifstream file(node->archive_path, std::ios::binary);
+        if (!file.is_open()) return FS_FILE_READERROR;
+
+        file.seekg(node->offset, std::ios::beg);
+        std::vector<u8> comp_data(node->size_compr);
+        file.read(reinterpret_cast<char*>(comp_data.data()), node->size_compr);
+
+        std::ofstream out(LocalName, std::ios::binary);
+        if (!out.is_open()) return FS_FILE_WRITEERROR;
+
+        if (node->size_real == node->size_compr) {
+            // Файл не сжат
+            out.write(reinterpret_cast<char*>(comp_data.data()), node->size_real);
+        } else {
+            // Файл сжат LZO
+            std::vector<u8> decomp_data(node->size_real);
+            lzo_uint out_len = node->size_real;
+            int r = lzo1x_decompress_safe(comp_data.data(), comp_data.size(), decomp_data.data(), &out_len, NULL);
+            if (r != LZO_E_OK) return FS_FILE_READERROR;
+            
+            out.write(reinterpret_cast<char*>(decomp_data.data()), out_len);
+        }
+        return FS_FILE_OK;
+    }
 }
