@@ -3,7 +3,7 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
-#include "lz4.h"
+#include "minilzo.h"
 
 std::vector<std::string> virtual_files;
 int current_file_index = 0;
@@ -49,19 +49,17 @@ void ReadFAT() {
     uint32_t offset = 0;
     bool found_fat = false;
 
-    // Читаем архив по Чанкам (Chunks) как в LocatorAPI::open_chunk
+    // Идем по Чанкам (Матрешка)
     while (offset < file_size) {
         uint32_t type = 0, size = 0;
-        file.read(reinterpret_cast<char*>(&type), 4);
-        file.read(reinterpret_cast<char*>(&size), 4);
+        if (!file.read(reinterpret_cast<char*>(&type), 4)) break;
+        if (!file.read(reinterpret_cast<char*>(&size), 4)) break;
         offset += 8;
 
-        // В X-Ray ID чанка - это младшие биты, а старший бит означает сжатие
         uint32_t id = type & 0x7FFFFFFF;
         bool is_compressed = (type & 0x80000000) != 0;
 
-        // Нам нужен Чанк №1 (Это таблица FAT)
-        if (id == 1) {
+        if (id == 1) { // Чанк №1 = Таблица FAT!
             found_fat = true;
             std::vector<uint8_t> chunk_data(size);
             file.read(reinterpret_cast<char*>(chunk_data.data()), size);
@@ -70,45 +68,51 @@ void ReadFAT() {
             uint32_t decomp_size = 0;
 
             if (is_compressed) {
-                // Если сжато, первые 4 байта - распакованный размер
+                // Если LZO, первые 4 байта хранят распакованный размер
                 decomp_size = *(uint32_t*)chunk_data.data();
                 decomp_fat.resize(decomp_size);
                 
-                int r = LZ4_decompress_safe(
-                    reinterpret_cast<char*>(chunk_data.data() + 4), 
-                    reinterpret_cast<char*>(decomp_fat.data()), 
+                lzo_uint out_len = decomp_size;
+                int r = lzo1x_decompress_safe(
+                    chunk_data.data() + 4, 
                     size - 4, 
-                    decomp_size
+                    decomp_fat.data(), 
+                    &out_len, 
+                    NULL
                 );
                 
-                if (r < 0) {
-                    virtual_files.push_back("ERROR_DECOMPRESS_CHUNK_1.txt");
+                if (r != LZO_E_OK) {
+                    virtual_files.push_back("ERROR_DECOMPRESS_LZO_" + std::to_string(r) + ".txt");
                     return;
                 }
+                decomp_size = static_cast<uint32_t>(out_len);
             } else {
                 decomp_size = size;
                 decomp_fat = std::move(chunk_data);
             }
 
-            // --- ПАРСИНГ FAT ---
+            // Парсим таблицу файлов точно по структурам из исходников
             uint32_t ptr = 0;
             int count = 0;
             
             while (ptr < decomp_size) {
-                // Структура узла как в CLocatorAPI::LoadArchive
+                if (ptr + 2 > decomp_size) break;
                 uint16_t item_size = *(uint16_t*)(decomp_fat.data() + ptr); ptr += 2;
                 
+                if (ptr + item_size > decomp_size) break;
+
                 uint32_t size_real = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
                 uint32_t size_compr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
                 uint32_t crc = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
                 
+                // Длина имени = общий размер куска минус 16 байт чисел
                 int name_length = item_size - 16;
                 std::string name(reinterpret_cast<char*>(decomp_fat.data() + ptr), name_length);
                 ptr += name_length;
                 
                 uint32_t file_ptr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
 
-                // Заменяем слеши, чтобы вывести просто списком
+                // Заменяем слеши на подчеркивания, чтобы вывести плоским списком
                 std::replace(name.begin(), name.end(), '\\', '_');
                 std::replace(name.begin(), name.end(), '/', '_');
 
@@ -121,7 +125,7 @@ void ReadFAT() {
             virtual_files.push_back("SUCCESS_TOTAL_FILES_" + std::to_string(count) + ".txt");
             break;
         } else {
-            // Если это не FAT (например INI или сырые данные) - просто перепрыгиваем
+            // Пропускаем неинтересные чанки
             file.seekg(size, std::ios::cur);
             offset += size;
         }
@@ -141,7 +145,10 @@ typedef struct {
 } tfsDefaultParamStruct;
 
 extern "C" {
-    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { return 0; }
+    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { 
+        if (lzo_init() != LZO_E_OK) return -1;
+        return 0; 
+    }
 
     __declspec(dllexport) HANDLE __stdcall FsFindFirst(char* path, WIN32_FIND_DATAA* FindData) {
         if (std::string(path) == "\\") ReadFAT();
