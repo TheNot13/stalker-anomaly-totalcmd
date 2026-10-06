@@ -28,7 +28,6 @@ inline void AddToVFS(const std::string& full_name, uint32_t real_size, uint32_t 
     size_t start = 0;
     size_t end = full_name.find('\\');
 
-    // Быстро режем путь и строим папки
     while (end != std::string::npos) {
         std::string part = full_name.substr(start, end - start);
         auto& next_node = current->children[part];
@@ -41,7 +40,6 @@ inline void AddToVFS(const std::string& full_name, uint32_t real_size, uint32_t 
         end = full_name.find('\\', start);
     }
 
-    // Сам файл
     std::string filename = full_name.substr(start);
     auto& file_node = current->children[filename];
     file_node.name = filename;
@@ -53,14 +51,20 @@ inline void AddToVFS(const std::string& full_name, uint32_t real_size, uint32_t 
 }
 
 inline void ParseArchive(const std::string& db_path) {
-    Logger("Сканирую архив: " + db_path);
     std::ifstream file(db_path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        Logger("[-] Не удалось открыть: " + db_path);
-        return;
-    }
+    if (!file.is_open()) return;
     
     uint32_t file_size = static_cast<uint32_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
+    
+    // --- ЗАЩИТА ОТ МУСОРА И ЧУЖИХ ФОРМАТОВ ---
+    uint32_t magic = 0;
+    file.read(reinterpret_cast<char*>(&magic), 4);
+    if ((magic & 0x7FFFFFFF) != 666) {
+        Logger("[-] Пропуск (не формат 666/Чанки): " + db_path);
+        return; 
+    }
+    
     file.seekg(0, std::ios::beg);
     uint32_t offset = 0;
 
@@ -74,10 +78,7 @@ inline void ParseArchive(const std::string& db_path) {
             uint32_t chunk_id = type & 0x7FFFFFFF;
             bool is_comp = (type & 0x80000000) != 0;
 
-            // Защита от мусорных данных (ограничение размера)
-            if (size == 0 || size > (file_size - offset)) {
-                break; 
-            }
+            if (size == 0 || size > (file_size - offset)) break; 
 
             if (chunk_id == 1) { // FAT
                 std::vector<uint8_t> chunk_data(size);
@@ -92,7 +93,7 @@ inline void ParseArchive(const std::string& db_path) {
                 }
 
                 if (decomp_fat.empty()) {
-                    Logger("[-] Ошибка распаковки FAT в архиве: " + db_path);
+                    Logger("[-] Ошибка распаковки FAT: " + db_path);
                     break;
                 }
 
@@ -110,20 +111,34 @@ inline void ParseArchive(const std::string& db_path) {
                     
                     int name_length = item_size - 16;
                     std::string name((char*)(decomp_fat.data() + ptr), name_length);
-                    ptr += name_length;
                     
+                    // --- СУРОВЫЙ САНИТАЙЗЕР СТРОК ---
+                    bool is_garbage = false;
+                    for (char c : name) {
+                        if ((unsigned char)c < 32) { // Если попался спецсимвол
+                            is_garbage = true;
+                            break;
+                        }
+                    }
+                    if (is_garbage || name.empty()) {
+                        Logger("[-] Обнаружен бинарный мусор, прерывание парсинга: " + db_path);
+                        break;
+                    }
+                    // ---------------------------------
+
+                    ptr += name_length;
                     uint32_t file_ptr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
 
                     AddToVFS(name, size_real, size_compr, file_ptr, db_path);
                 }
-                Logger("[+] Успех: " + db_path);
-                break;
+                Logger("[+] Успешно прочитан: " + db_path);
+                break; // FAT прочитан, идем к следующему архиву
             } else {
                 file.seekg(size, std::ios::cur);
                 offset += size;
             }
         }
     } catch (...) {
-        Logger("[-] КРИТИЧЕСКАЯ ОШИБКА (КРАШ) в архиве: " + db_path);
+        Logger("[-] КРИТИЧЕСКАЯ ОШИБКА в архиве: " + db_path);
     }
 }
