@@ -260,10 +260,29 @@ void Decode(void) {
         }
     }
 }
+// --- ЛОГИКА ПЛАГИНА (ВИРТУАЛЬНОЕ ДЕРЕВО) ---
+#include <map>
+#include <sstream>
 
-// --- ЛОГИКА ПЛАГИНА ---
-std::vector<std::string> virtual_files;
-int current_file_index = 0;
+struct VfsNode {
+    std::string name;
+    bool is_dir;
+    uint32_t size_real;
+    uint32_t offset;
+    std::map<std::string, VfsNode> children;
+};
+
+VfsNode vfs_root;
+bool vfs_loaded = false;
+
+struct FindItem {
+    std::string name;
+    bool is_dir;
+    uint32_t size;
+};
+
+std::vector<FindItem> current_find_items;
+int current_find_index = 0;
 
 std::string GetIniPath() {
     char path[MAX_PATH];
@@ -276,15 +295,29 @@ std::string GetIniPath() {
     return "anomaly_db.ini";
 }
 
+// Функция разбивки пути "configs\weapons\w_ak.ltx" на куски
+std::vector<std::string> SplitPath(const std::string& path) {
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    std::string item;
+    while (std::getline(ss, item, '\\')) {
+        if (!item.empty()) parts.push_back(item);
+    }
+    return parts;
+}
+
 void ReadFAT() {
-    virtual_files.clear();
+    vfs_root.children.clear();
     
     char result[MAX_PATH];
     GetPrivateProfileStringA("Settings", "DbPath", "", result, MAX_PATH, GetIniPath().c_str());
     std::string db_path(result);
     
     std::ifstream file(db_path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) return;
+    if (!file.is_open()) {
+        vfs_root.children["ERROR_FILE_NOT_FOUND.txt"] = {"ERROR_FILE_NOT_FOUND.txt", false, 0, 0};
+        return;
+    }
     
     uint32_t file_size = static_cast<uint32_t>(file.tellg());
     file.seekg(0, std::ios::beg);
@@ -298,7 +331,7 @@ void ReadFAT() {
 
         uint32_t chunk_id = type & 0x7FFFFFFF;
 
-        if (chunk_id == 1) { // FAT
+        if (chunk_id == 1) { // Это FAT!
             std::vector<uint8_t> chunk_data(size);
             file.read(reinterpret_cast<char*>(chunk_data.data()), size);
 
@@ -309,7 +342,7 @@ void ReadFAT() {
             uint32_t decomp_size = fs.OutSize();
 
             uint32_t ptr = 0;
-            int count = 0;
+            // Убрали лимит в 200 файлов, теперь читаем ВСЁ архивы!
             while (ptr < decomp_size) {
                 if (ptr + 2 > decomp_size) break;
                 uint16_t item_size = *(uint16_t*)(decomp_fat + ptr); ptr += 2;
@@ -325,14 +358,28 @@ void ReadFAT() {
                 
                 uint32_t file_ptr = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
 
-                std::replace(name.begin(), name.end(), '\\', '_');
-                std::replace(name.begin(), name.end(), '/', '_');
-
-                if (count < 200) virtual_files.push_back(name);
-                count++;
+                // Строим дерево!
+                std::vector<std::string> parts = SplitPath(name);
+                VfsNode* current = &vfs_root;
+                
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    const std::string& part = parts[i];
+                    if (current->children.find(part) == current->children.end()) {
+                        VfsNode node;
+                        node.name = part;
+                        node.is_dir = (i < parts.size() - 1); 
+                        node.size_real = 0;
+                        node.offset = 0;
+                        current->children[part] = node;
+                    }
+                    current = &current->children[part];
+                }
+                
+                // Финальный узел - это сам файл
+                current->is_dir = false;
+                current->size_real = size_real;
+                current->offset = file_ptr; 
             }
-            
-            virtual_files.push_back("SUCCESS_FILES_" + std::to_string(count) + ".txt");
             free(decomp_fat);
             break;
         } else {
@@ -342,29 +389,79 @@ void ReadFAT() {
     }
 }
 
-// --- WFX API ---
+// --- WFX API (Работа с Total Commander) ---
 typedef struct { int size; DWORD vLow; DWORD vHi; char ini[MAX_PATH]; } tfsDefaultParamStruct;
 
 extern "C" {
     __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { return 0; }
 
     __declspec(dllexport) HANDLE __stdcall FsFindFirst(char* path, WIN32_FIND_DATAA* FindData) {
-        if (std::string(path) == "\\") ReadFAT();
-        current_file_index = 0;
-        if (virtual_files.empty()) { SetLastError(ERROR_NO_MORE_FILES); return INVALID_HANDLE_VALUE; }
+        // Читаем архив только один раз при входе
+        if (!vfs_loaded) {
+            ReadFAT();
+            vfs_loaded = true;
+        }
+
+        current_find_items.clear();
+        current_find_index = 0;
+
+        // Ищем папку, в которую зашел пользователь
+        std::string search_path(path);
+        std::vector<std::string> parts = SplitPath(search_path);
+        
+        VfsNode* current = &vfs_root;
+        bool found = true;
+        for (const std::string& p : parts) {
+            if (current->children.find(p) != current->children.end()) {
+                current = &current->children[p];
+            } else {
+                found = false;
+                break;
+            }
+        }
+
+        // Если папка пустая или не найдена
+        if (!found || current->children.empty()) {
+            SetLastError(ERROR_NO_MORE_FILES);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        // Выгружаем содержимое папки для Total Commander
+        for (auto const& [key, val] : current->children) {
+            current_find_items.push_back({val.name, val.is_dir, val.size_real});
+        }
+
         memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
-        lstrcpynA(FindData->cFileName, virtual_files[current_file_index].c_str(), MAX_PATH);
-        FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-        current_file_index++;
+        lstrcpynA(FindData->cFileName, current_find_items[0].name.c_str(), MAX_PATH);
+        
+        if (current_find_items[0].is_dir) {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        } else {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            FindData->nFileSizeLow = current_find_items[0].size;
+        }
+        
+        current_find_index = 1;
         return (HANDLE)1; 
     }
 
     __declspec(dllexport) BOOL __stdcall FsFindNext(HANDLE Hdl, WIN32_FIND_DATAA* FindData) {
-        if (current_file_index >= virtual_files.size()) { SetLastError(ERROR_NO_MORE_FILES); return FALSE; }
+        if (current_find_index >= current_find_items.size()) {
+            SetLastError(ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        
         memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
-        lstrcpynA(FindData->cFileName, virtual_files[current_file_index].c_str(), MAX_PATH);
-        FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-        current_file_index++;
+        lstrcpynA(FindData->cFileName, current_find_items[current_find_index].name.c_str(), MAX_PATH);
+        
+        if (current_find_items[current_find_index].is_dir) {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        } else {
+            FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            FindData->nFileSizeLow = current_find_items[current_find_index].size;
+        }
+        
+        current_find_index++;
         return TRUE;
     }
 
