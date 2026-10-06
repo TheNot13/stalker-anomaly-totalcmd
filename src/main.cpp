@@ -13,6 +13,14 @@ struct FindItem {
 std::vector<FindItem> current_find_items;
 int current_find_index = 0;
 
+void Logger(const std::string& msg) {
+    // Пишем логи в общую папку
+    std::ofstream log("C:\\Users\\Public\\anomaly_wfx.log", std::ios::app);
+    if (log.is_open()) {
+        log << msg << "\n";
+    }
+}
+
 std::string GetIniPath() {
     char path[MAX_PATH];
     HMODULE hm = NULL;
@@ -31,31 +39,38 @@ void BuildVFS() {
     GetPrivateProfileStringA("Settings", "GamePath", "", result, MAX_PATH, GetIniPath().c_str());
     std::string game_path(result);
     
+    Logger("==== СТАРТ ПЛАГИНА ====");
+    Logger("Путь к игре: " + game_path);
+
     if (game_path.empty() || !fs::exists(game_path)) {
         VfsNode err;
         err.name = "ERROR_GAMEPATH_NOT_FOUND_IN_INI.txt";
         err.is_dir = false;
         vfs_root.children[err.name] = err;
+        Logger("Ошибка: Путь не найден!");
         return;
     }
 
     std::vector<std::string> archives;
     
-    // Ищем все .db и .xdb файлы в папке игры (включая вложенные)
-    for (const auto& entry : fs::recursive_directory_iterator(game_path)) {
-        if (entry.is_regular_file()) {
-            std::string name = entry.path().filename().string();
-            if (name.find(".db") != std::string::npos || name.find(".xdb") != std::string::npos) {
-                archives.push_back(entry.path().string());
+    try {
+        for (const auto& entry : fs::recursive_directory_iterator(game_path)) {
+            if (entry.is_regular_file()) {
+                std::string name = entry.path().filename().string();
+                if (name.find(".db") != std::string::npos || name.find(".xdb") != std::string::npos) {
+                    archives.push_back(entry.path().string());
+                }
             }
         }
-    }
 
-    // Сортировка по алфавиту ОБЯЗАТЕЛЬНА! (Так патчи db1 перекроют db0)
-    std::sort(archives.begin(), archives.end());
+        std::sort(archives.begin(), archives.end());
+        Logger("Найдено архивов: " + std::to_string(archives.size()));
 
-    for (const auto& arc : archives) {
-        ParseArchive(arc);
+        for (const auto& arc : archives) {
+            ParseArchive(arc);
+        }
+    } catch (...) {
+        Logger("Критическая ошибка во время сканирования папки!");
     }
 }
 
@@ -63,72 +78,104 @@ void BuildVFS() {
 typedef struct { int size; DWORD vLow; DWORD vHi; char ini[MAX_PATH]; } tfsDefaultParamStruct;
 
 extern "C" {
-    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { return 0; }
+    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { 
+        // Очищаем лог при старте
+        std::ofstream log("C:\\Users\\Public\\anomaly_wfx.log", std::ios::trunc);
+        return 0; 
+    }
 
     __declspec(dllexport) HANDLE __stdcall FsFindFirst(char* path, WIN32_FIND_DATAA* FindData) {
-        if (!vfs_loaded) {
-            BuildVFS();
-            vfs_loaded = true;
-        }
-
-        current_find_items.clear();
-        current_find_index = 0;
-
-        std::string search_path(path);
-        std::vector<std::string> parts = SplitPath(search_path);
-        
-        VfsNode* current = &vfs_root;
-        bool found = true;
-        for (const std::string& p : parts) {
-            if (current->children.find(p) != current->children.end()) {
-                current = &current->children[p];
-            } else {
-                found = false;
-                break;
+        try {
+            if (!vfs_loaded) {
+                BuildVFS();
+                vfs_loaded = true;
             }
-        }
 
-        if (!found || current->children.empty()) {
+            current_find_items.clear();
+            current_find_index = 0;
+
+            std::string search_path(path);
+            
+            VfsNode* current = &vfs_root;
+            bool found = true;
+            
+            // Ручной сплит пути без лишних векторов
+            size_t start = 0;
+            if (!search_path.empty() && search_path[0] == '\\') start = 1;
+            size_t end = search_path.find('\\', start);
+
+            while (end != std::string::npos) {
+                std::string part = search_path.substr(start, end - start);
+                if (current->children.find(part) != current->children.end()) {
+                    current = &current->children[part];
+                } else {
+                    found = false;
+                    break;
+                }
+                start = end + 1;
+                end = search_path.find('\\', start);
+            }
+
+            if (found && start < search_path.length()) {
+                std::string part = search_path.substr(start);
+                if (current->children.find(part) != current->children.end()) {
+                    current = &current->children[part];
+                } else {
+                    found = false;
+                }
+            }
+
+            if (!found || current->children.empty()) {
+                SetLastError(ERROR_NO_MORE_FILES);
+                return INVALID_HANDLE_VALUE;
+            }
+
+            // Копируем данные в вектор для выдачи Тоталу
+            for (auto const& [key, val] : current->children) {
+                current_find_items.push_back({val.name, val.is_dir, val.size_real});
+            }
+
+            memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
+            lstrcpynA(FindData->cFileName, current_find_items[0].name.c_str(), MAX_PATH);
+            
+            if (current_find_items[0].is_dir) {
+                FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+            } else {
+                FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+                FindData->nFileSizeLow = current_find_items[0].size;
+            }
+            
+            current_find_index = 1;
+            return (HANDLE)1; 
+        } catch (...) {
+            Logger("Критическая ошибка в FsFindFirst");
             SetLastError(ERROR_NO_MORE_FILES);
             return INVALID_HANDLE_VALUE;
         }
-
-        for (auto const& [key, val] : current->children) {
-            current_find_items.push_back({val.name, val.is_dir, val.size_real});
-        }
-
-        memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
-        lstrcpynA(FindData->cFileName, current_find_items[0].name.c_str(), MAX_PATH);
-        
-        if (current_find_items[0].is_dir) {
-            FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-        } else {
-            FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-            FindData->nFileSizeLow = current_find_items[0].size;
-        }
-        
-        current_find_index = 1;
-        return (HANDLE)1; 
     }
 
     __declspec(dllexport) BOOL __stdcall FsFindNext(HANDLE Hdl, WIN32_FIND_DATAA* FindData) {
-        if (current_find_index >= current_find_items.size()) {
-            SetLastError(ERROR_NO_MORE_FILES);
+        try {
+            if (current_find_index >= current_find_items.size()) {
+                SetLastError(ERROR_NO_MORE_FILES);
+                return FALSE;
+            }
+            
+            memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
+            lstrcpynA(FindData->cFileName, current_find_items[current_find_index].name.c_str(), MAX_PATH);
+            
+            if (current_find_items[current_find_index].is_dir) {
+                FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+            } else {
+                FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+                FindData->nFileSizeLow = current_find_items[current_find_index].size;
+            }
+            
+            current_find_index++;
+            return TRUE;
+        } catch (...) {
             return FALSE;
         }
-        
-        memset(FindData, 0, sizeof(WIN32_FIND_DATAA));
-        lstrcpynA(FindData->cFileName, current_find_items[current_find_index].name.c_str(), MAX_PATH);
-        
-        if (current_find_items[current_find_index].is_dir) {
-            FindData->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-        } else {
-            FindData->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-            FindData->nFileSizeLow = current_find_items[current_find_index].size;
-        }
-        
-        current_find_index++;
-        return TRUE;
     }
 
     __declspec(dllexport) int __stdcall FsFindClose(HANDLE Hdl) { return 0; }
