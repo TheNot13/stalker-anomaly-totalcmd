@@ -3,7 +3,6 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
-#include "minilzo.h"
 
 std::vector<std::string> virtual_files;
 int current_file_index = 0;
@@ -47,9 +46,8 @@ void ReadFAT() {
     file.seekg(0, std::ios::beg);
 
     uint32_t offset = 0;
-    bool found_fat = false;
 
-    // Идем по Чанкам (Матрешка)
+    // Сканируем все чанки
     while (offset < file_size) {
         uint32_t type = 0, size = 0;
         if (!file.read(reinterpret_cast<char*>(&type), 4)) break;
@@ -57,82 +55,41 @@ void ReadFAT() {
         offset += 8;
 
         uint32_t id = type & 0x7FFFFFFF;
-        bool is_compressed = (type & 0x80000000) != 0;
+        bool is_comp = (type & 0x80000000) != 0;
 
-        if (id == 1) { // Чанк №1 = Таблица FAT!
-            found_fat = true;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "CHUNK_ID_%u_%s_SIZE_%u.txt", id, is_comp ? "COMPRESSED" : "RAW", size);
+        virtual_files.push_back(std::string(buf));
+
+        if (id == 1) { // Это наш FAT!
             std::vector<uint8_t> chunk_data(size);
             file.read(reinterpret_cast<char*>(chunk_data.data()), size);
-
-            std::vector<uint8_t> decomp_fat;
-            uint32_t decomp_size = 0;
-
-            if (is_compressed) {
-                // Если LZO, первые 4 байта хранят распакованный размер
-                decomp_size = *(uint32_t*)chunk_data.data();
-                decomp_fat.resize(decomp_size);
-                
-                lzo_uint out_len = decomp_size;
-                int r = lzo1x_decompress_safe(
-                    chunk_data.data() + 4, 
-                    size - 4, 
-                    decomp_fat.data(), 
-                    &out_len, 
-                    NULL
-                );
-                
-                if (r != LZO_E_OK) {
-                    virtual_files.push_back("ERROR_DECOMPRESS_LZO_" + std::to_string(r) + ".txt");
-                    return;
-                }
-                decomp_size = static_cast<uint32_t>(out_len);
-            } else {
-                decomp_size = size;
-                decomp_fat = std::move(chunk_data);
-            }
-
-            // Парсим таблицу файлов точно по структурам из исходников
-            uint32_t ptr = 0;
-            int count = 0;
             
-            while (ptr < decomp_size) {
-                if (ptr + 2 > decomp_size) break;
-                uint16_t item_size = *(uint16_t*)(decomp_fat.data() + ptr); ptr += 2;
-                
-                if (ptr + item_size > decomp_size) break;
-
-                uint32_t size_real = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-                uint32_t size_compr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-                uint32_t crc = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-                
-                // Длина имени = общий размер куска минус 16 байт чисел
-                int name_length = item_size - 16;
-                std::string name(reinterpret_cast<char*>(decomp_fat.data() + ptr), name_length);
-                ptr += name_length;
-                
-                uint32_t file_ptr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-
-                // Заменяем слеши на подчеркивания, чтобы вывести плоским списком
-                std::replace(name.begin(), name.end(), '\\', '_');
-                std::replace(name.begin(), name.end(), '/', '_');
-
-                if (count < 200) {
-                    virtual_files.push_back(name);
+            std::string dump_path = "C:\\Users\\Public\\anomaly_chunk1_dump.txt"; 
+            std::ofstream dump(dump_path);
+            if (dump.is_open()) {
+                dump << "CHUNK 1 (FAT) DUMP:\n";
+                for (int i = 0; i < min((int)size, 256); i++) {
+                    char hex[8];
+                    snprintf(hex, sizeof(hex), "%02X ", chunk_data[i]);
+                    dump << hex;
+                    if ((i + 1) % 16 == 0) dump << "\n";
                 }
-                count++;
+                dump << "\nASCII:\n";
+                for (int i = 0; i < min((int)size, 256); i++) {
+                    if (chunk_data[i] >= 32 && chunk_data[i] <= 126) dump << (char)chunk_data[i];
+                    else dump << ".";
+                    if ((i + 1) % 64 == 0) dump << "\n";
+                }
+                dump.close();
+                virtual_files.push_back("CHUNK1_DUMP_SAVED_TO_PUBLIC.txt");
             }
             
-            virtual_files.push_back("SUCCESS_TOTAL_FILES_" + std::to_string(count) + ".txt");
-            break;
+            offset += size;
         } else {
-            // Пропускаем неинтересные чанки
             file.seekg(size, std::ios::cur);
             offset += size;
         }
-    }
-
-    if (!found_fat) {
-        virtual_files.push_back("ERROR_FAT_CHUNK_NOT_FOUND.txt");
     }
 }
 
@@ -145,10 +102,7 @@ typedef struct {
 } tfsDefaultParamStruct;
 
 extern "C" {
-    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { 
-        if (lzo_init() != LZO_E_OK) return -1;
-        return 0; 
-    }
+    __declspec(dllexport) int __stdcall FsInit(int PluginNr, tfsDefaultParamStruct* pDefaultParam) { return 0; }
 
     __declspec(dllexport) HANDLE __stdcall FsFindFirst(char* path, WIN32_FIND_DATAA* FindData) {
         if (std::string(path) == "\\") ReadFAT();
