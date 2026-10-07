@@ -43,11 +43,11 @@ void BuildVFS() {
     std::string game_path(result);
     
     Logger("=== СКАНИРОВАНИЕ ДИРЕКТОРИИ: " + game_path + " ===");
-    if (game_path.empty() || !fs::exists(game_path)) return;
+    if (game_path.empty() || !stdfs::exists(game_path)) return;
 
     std::vector<std::string> archives;
     try {
-        for (const auto& entry : fs::recursive_directory_iterator(game_path)) {
+        for (const auto& entry : stdfs::recursive_directory_iterator(game_path)) {
             if (entry.is_regular_file()) {
                 std::string name = entry.path().filename().string();
                 if (name.find(".db") != std::string::npos || name.find(".xdb") != std::string::npos) {
@@ -177,9 +177,8 @@ extern "C" {
                 out.write(reinterpret_cast<char*>(decomp_data.data()), out_len);
             } else {
                 // Если не LZO, пробуем LzHuf
-                LzhDecoder decoder;
-                std::vector<u8> dec = decoder.Decode(comp_data.data(), comp_data.size());
-                if (!dec.empty()) {
+                std::vector<u8> dec;
+                if (DecompressLzHuf(comp_data.data(), (u32)comp_data.size(), dec)) {
                     out.write(reinterpret_cast<char*>(dec.data()), dec.size());
                 } else {
                     return FS_FILE_READERROR;
