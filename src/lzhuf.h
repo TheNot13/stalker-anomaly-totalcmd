@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <malloc.h>
+#include <vector>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -130,7 +131,7 @@ public:
     }
 };
 
-static LZfs fs;
+static LZfs lz_fs;
 
 inline void StartHuff(void) {
     int i, j;
@@ -205,7 +206,7 @@ inline void update(int c) {
 inline int DecodeChar(void) {
     unsigned c = son[R];
     while (c < T) {
-        c += fs.GetBit();
+        c += lz_fs.GetBit();
         c = son[c];
     }
     c -= T;
@@ -215,24 +216,24 @@ inline int DecodeChar(void) {
 
 inline int DecodePosition(void) {
     unsigned i, j, c;
-    i = fs.GetByte();
+    i = lz_fs.GetByte();
     c = (unsigned)d_code[i] << 6;
     j = d_len[i];
     j -= 2;
-    while (j--) i = (i << 1) + fs.GetBit();
+    while (j--) i = (i << 1) + lz_fs.GetBit();
     return (int)(c | (i & 0x3f));
 }
 
 inline void Decode(void) {
     int i, j, k, r, c;
     unsigned int count;
-    unsigned int textsize = (fs._getb());
-    textsize |= (fs._getb() << 8);
-    textsize |= (fs._getb() << 16);
-    textsize |= (fs._getb() << 24);
+    unsigned int textsize = (lz_fs._getb());
+    textsize |= (lz_fs._getb() << 8);
+    textsize |= (lz_fs._getb() << 16);
+    textsize |= (lz_fs._getb() << 24);
     if (textsize == 0 || textsize > 100 * 1024 * 1024) return;
 
-    fs.Init_Output(textsize);
+    lz_fs.Init_Output(textsize);
     StartHuff();
     for (i = 0; i < N - F; i++) text_buf[i] = 0x20;
     r = N - F;
@@ -240,7 +241,7 @@ inline void Decode(void) {
     for (count = 0; count < textsize;) {
         c = DecodeChar();
         if (c < 256) {
-            fs._putb(c);
+            lz_fs._putb(c);
             text_buf[r++] = (unsigned char)c;
             r &= (N - 1);
             count++;
@@ -249,11 +250,22 @@ inline void Decode(void) {
             j = c - 255 + THRESHOLD;
             for (k = 0; k < j; k++) {
                 c = text_buf[(i + k) & (N - 1)];
-                fs._putb(c);
+                lz_fs._putb(c);
                 text_buf[r++] = (unsigned char)c;
                 r &= (N - 1);
                 count++;
             }
         }
     }
+}
+
+inline bool DecompressLzHuf(const u8* src, u32 src_sz, std::vector<u8>& out) {
+    lz_fs.Init_Input((u8*)src, (u8*)src + src_sz);
+    Decode();
+    u8* ptr = lz_fs.OutPointer();
+    u32 sz = lz_fs.OutSize();
+    if (!ptr || sz == 0) return false;
+    out.assign(ptr, ptr + sz);
+    lz_fs.OutRelease();
+    return true;
 }
