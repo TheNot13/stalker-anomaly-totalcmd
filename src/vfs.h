@@ -36,7 +36,6 @@ inline void AddToVFS(const std::string& full_name, uint32_t real_size, uint32_t 
         clean_name.erase(0, 1);
     }
     if (clean_name.empty()) return;
-
     if (is_explicit_dir) clean_name.pop_back();
 
     VfsNode* current = &vfs_root;
@@ -75,61 +74,6 @@ inline void AddToVFS(const std::string& full_name, uint32_t real_size, uint32_t 
     }
 }
 
-// Проверка валидности распакованной таблицы FAT
-inline bool TryParseFAT(const std::vector<u8>& decomp_fat, const std::string& db_path, const std::string& entry_point_prefix, FILETIME arc_time, int& files_added) {
-    if (decomp_fat.size() < 18) return false;
-    
-    // Проверяем первый же элемент: размер узла не может быть больше MAX_PATH (260) + 16 байт
-    uint16_t first_size = *(uint16_t*)decomp_fat.data();
-    if (first_size < 17 || first_size > 276) return false;
-    
-    int first_name_len = first_size - 16;
-    const char* first_name = (const char*)(decomp_fat.data() + 14);
-    for (int i = 0; i < first_name_len; ++i) {
-        unsigned char c = (unsigned char)first_name[i];
-        if (c < 32 || c > 126) return false; // Имена файлов Сталкера ВСЕГДА чистый ASCII!
-    }
-
-    // Если первая запись — чистый ASCII, парсим весь буфер
-    uint32_t ptr = 0;
-    uint32_t decomp_size = (uint32_t)decomp_fat.size();
-    files_added = 0;
-
-    while (ptr + 2 <= decomp_size) {
-        uint16_t item_size = *(uint16_t*)(decomp_fat.data() + ptr); 
-        ptr += 2;
-        
-        if (item_size < 16 || (ptr - 2 + item_size) > decomp_size) break;
-        
-        uint32_t size_real = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-        uint32_t size_compr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-        uint32_t crc = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-        
-        int name_length = item_size - 16;
-        if (name_length <= 0 || name_length > 260) break;
-
-        std::string name((char*)(decomp_fat.data() + ptr), name_length);
-        ptr += name_length;
-        uint32_t file_ptr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
-
-        size_t null_pos = name.find('\0');
-        if (null_pos != std::string::npos) name = name.substr(0, null_pos);
-
-        // Строжайшая проверка на чистоту символов
-        bool valid = !name.empty();
-        for (unsigned char c : name) {
-            if (c < 32 || c > 126) { valid = false; break; }
-        }
-
-        if (valid) {
-            std::string full_name = entry_point_prefix + name;
-            AddToVFS(full_name, size_real, size_compr, file_ptr, db_path, arc_time);
-            files_added++;
-        }
-    }
-    return files_added > 0;
-}
-
 inline void ParseArchive(const std::string& db_path) {
     FILETIME arc_time = {0, 0};
     HANDLE hFile = CreateFileA(db_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -158,7 +102,7 @@ inline void ParseArchive(const std::string& db_path) {
 
             if (size == 0 || size > (file_size - offset)) break; 
 
-            // Чанки заголовка INI
+            // Чанк заголовка
             if (chunk_id == 666 || chunk_id == 29) { 
                 std::string ini_data(size, '\0');
                 file.read(ini_data.data(), size);
@@ -189,47 +133,68 @@ inline void ParseArchive(const std::string& db_path) {
                     }
                 }
             }
-            // Чанк FAT таблицы
+            // Чанк FAT таблицы файлов
             else if (chunk_id == 1) { 
                 std::vector<uint8_t> chunk_data(size);
                 file.read(reinterpret_cast<char*>(chunk_data.data()), size);
                 offset += size;
 
-                int files_count = 0;
-                bool ok = false;
+                u8* decomp_fat = nullptr;
+                uint32_t decomp_size = 0;
+                bool need_free = false;
 
                 if (!is_comp) {
-                    ok = TryParseFAT(chunk_data, db_path, entry_point_prefix, arc_time, files_count);
-                    if (ok) Logger("[RAW FAT] " + db_path + " (" + std::to_string(files_count) + " файлов)");
+                    decomp_fat = chunk_data.data();
+                    decomp_size = size;
                 } else {
-                    // 1. Сначала пробуем стандартный LZO!
-                    if (size > 4) {
-                        uint32_t expected_size = *(uint32_t*)chunk_data.data();
-                        if (expected_size > 0 && expected_size < 50 * 1024 * 1024) {
-                            std::vector<u8> decomp_lzo(expected_size);
-                            lzo_uint out_len = expected_size;
-                            int r = lzo1x_decompress_safe(chunk_data.data() + 4, size - 4, decomp_lzo.data(), &out_len, NULL);
-                            if (r == LZO_E_OK) {
-                                ok = TryParseFAT(decomp_lzo, db_path, entry_point_prefix, arc_time, files_count);
-                                if (ok) Logger("[LZO FAT] " + db_path + " (" + std::to_string(files_count) + " файлов)");
-                            }
-                        }
+                    // Используем рабочий C-декодер!
+                    fs.Init_Input(chunk_data.data(), chunk_data.data() + size);
+                    Decode();
+                    decomp_fat = fs.OutPointer();
+                    decomp_size = fs.OutSize();
+                    need_free = true;
+                }
+
+                if (!decomp_fat || decomp_size == 0) break;
+
+                uint32_t ptr = 0;
+                int count = 0;
+
+                while (ptr + 2 <= decomp_size) {
+                    uint16_t item_size = *(uint16_t*)(decomp_fat + ptr); 
+                    ptr += 2;
+                    
+                    if (item_size < 16 || (ptr - 2 + item_size) > decomp_size) break;
+                    
+                    uint32_t size_real = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
+                    uint32_t size_compr = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
+                    uint32_t crc = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
+                    
+                    int name_length = item_size - 16;
+                    if (name_length <= 0 || name_length > 260) break;
+
+                    std::string name((char*)(decomp_fat + ptr), name_length);
+                    ptr += name_length;
+                    uint32_t file_ptr = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
+
+                    size_t null_pos = name.find('\0');
+                    if (null_pos != std::string::npos) name = name.substr(0, null_pos);
+
+                    // Проверяем чистоту имени
+                    bool valid = !name.empty();
+                    for (unsigned char c : name) {
+                        if (c < 32 || c > 126) { valid = false; break; }
                     }
 
-                    // 2. Если LZO не подошел — пробуем LzHuf!
-                    if (!ok) {
-                        LzhDecoder decoder;
-                        std::vector<u8> decomp_lzh = decoder.Decode(chunk_data.data(), size);
-                        if (!decomp_lzh.empty()) {
-                            ok = TryParseFAT(decomp_lzh, db_path, entry_point_prefix, arc_time, files_count);
-                            if (ok) Logger("[LzHuf FAT] " + db_path + " (" + std::to_string(files_count) + " файлов)");
-                        }
-                    }
-
-                    if (!ok) {
-                        Logger("[-] Не удалось прочитать FAT: " + db_path);
+                    if (valid) {
+                        std::string full_name = entry_point_prefix + name;
+                        AddToVFS(full_name, size_real, size_compr, file_ptr, db_path, arc_time);
+                        count++;
                     }
                 }
+                
+                Logger(db_path + " -> " + std::to_string(count) + " файлов");
+                if (need_free) fs.OutRelease();
                 break;
             } else {
                 file.seekg(size, std::ios::cur);
