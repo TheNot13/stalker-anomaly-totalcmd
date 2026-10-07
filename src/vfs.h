@@ -9,7 +9,7 @@
 #include "lzhuf.h"
 #include "minilzo.h"
 
-namespace fs = std::filesystem;
+namespace stdfs = std::filesystem;
 
 struct VfsNode {
     std::string name;
@@ -133,54 +133,46 @@ inline void ParseArchive(const std::string& db_path) {
                     }
                 }
             }
-            // Чанк FAT таблицы файлов
+            // Чанк FAT таблицы
             else if (chunk_id == 1) { 
                 std::vector<uint8_t> chunk_data(size);
                 file.read(reinterpret_cast<char*>(chunk_data.data()), size);
                 offset += size;
 
-                u8* decomp_fat = nullptr;
-                uint32_t decomp_size = 0;
-                bool need_free = false;
-
+                std::vector<u8> decomp_fat;
                 if (!is_comp) {
-                    decomp_fat = chunk_data.data();
-                    decomp_size = size;
+                    decomp_fat = std::move(chunk_data);
                 } else {
-                    // Используем рабочий C-декодер!
-                    fs.Init_Input(chunk_data.data(), chunk_data.data() + size);
-                    Decode();
-                    decomp_fat = fs.OutPointer();
-                    decomp_size = fs.OutSize();
-                    need_free = true;
+                    DecompressLzHuf(chunk_data.data(), size, decomp_fat);
                 }
 
-                if (!decomp_fat || decomp_size == 0) break;
+                if (decomp_fat.empty()) break;
 
                 uint32_t ptr = 0;
+                uint32_t decomp_size = (uint32_t)decomp_fat.size();
                 int count = 0;
 
                 while (ptr + 2 <= decomp_size) {
-                    uint16_t item_size = *(uint16_t*)(decomp_fat + ptr); 
+                    uint16_t item_size = *(uint16_t*)(decomp_fat.data() + ptr); 
                     ptr += 2;
                     
                     if (item_size < 16 || (ptr - 2 + item_size) > decomp_size) break;
                     
-                    uint32_t size_real = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
-                    uint32_t size_compr = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
-                    uint32_t crc = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
+                    uint32_t size_real = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
+                    uint32_t size_compr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
+                    uint32_t crc = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
                     
                     int name_length = item_size - 16;
                     if (name_length <= 0 || name_length > 260) break;
 
-                    std::string name((char*)(decomp_fat + ptr), name_length);
+                    std::string name((char*)(decomp_fat.data() + ptr), name_length);
                     ptr += name_length;
-                    uint32_t file_ptr = *(uint32_t*)(decomp_fat + ptr); ptr += 4;
+                    uint32_t file_ptr = *(uint32_t*)(decomp_fat.data() + ptr); ptr += 4;
 
                     size_t null_pos = name.find('\0');
                     if (null_pos != std::string::npos) name = name.substr(0, null_pos);
 
-                    // Проверяем чистоту имени
+                    // Проверка на латиницу/ASCII
                     bool valid = !name.empty();
                     for (unsigned char c : name) {
                         if (c < 32 || c > 126) { valid = false; break; }
@@ -194,7 +186,6 @@ inline void ParseArchive(const std::string& db_path) {
                 }
                 
                 Logger(db_path + " -> " + std::to_string(count) + " файлов");
-                if (need_free) fs.OutRelease();
                 break;
             } else {
                 file.seekg(size, std::ios::cur);
