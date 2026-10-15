@@ -1,4 +1,4 @@
-name: Build WFX Plugin
+name: Build Plugins (x64)
 
 on: [push, pull_request]
 
@@ -12,11 +12,13 @@ jobs:
     - name: Настройка CMake (x64)
       run: cmake -B build_x64 -A x64
 
-    - name: Компиляция плагина
+    - name: Компиляция плагинов
       run: cmake --build build_x64 --config Release
 
-    - name: Загрузка готового плагина
+    - name: Загрузка готовых плагинов
       uses: actions/upload-artifact@v4
       with:
-        name: Anomaly_Plugin_x64
-        path: build_x64/Release/anomaly_db.wfx64
+        name: Anomaly_Plugins_x64
+        path: |
+          build_x64/Release/anomaly_db.wfx64
+          build_x64/Release/anomaly_7z.dll
